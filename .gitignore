@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# 环境
+venv/
+ENV/
+env/
+
+# 日志文件
+*.log
+log/
+
+# 检查点和模型文件（太大，不上传）
+checkpoints/
+*.pth
+*.bin
+*.safetensors
+
+# 数据文件（太大，不上传）
+data/
+*.parquet
+*.csv
+*.jsonl
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WandB
+wandb/
+
+# 其他
+outputs/
+figures/
