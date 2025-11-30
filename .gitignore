@@ -37,12 +37,14 @@ env/
 # 日志文件
 *.log
 log/
+logs/
 
 # 检查点和模型文件（太大，不上传）
 checkpoints/
 *.pth
 *.bin
 *.safetensors
+models/
 
 # 数据文件（太大，不上传）
 data/
@@ -68,3 +70,5 @@ wandb/
 # 其他
 outputs/
 figures/
+results/
+readme_list/

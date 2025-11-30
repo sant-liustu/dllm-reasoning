@@ -69,6 +69,7 @@ class SFTDataset(Dataset):
             pad_token_id if pad_token_id is not None else self.tokenizer.pad_token_id
         )
         self.pad_input = pad_input
+        self._logged_first_sample = False  # 用于控制只记录第一个样本的验证信息
         self._download()
         self._read_files_and_tokenize()
 
@@ -167,16 +168,21 @@ class SFTDataset(Dataset):
                 response_content = response
 
             # Apply chat template to prompt only (with add_generation_prompt=True)
-            # This gives us: <|im_start|>system\n...<|im_start|>user\n...<|im_start|>assistant\n
+            # This gives us: <｜begin▁of▁sentence｜>...<｜User｜>...<｜Assistant｜><think>\n
             prompt_only_str = tokenizer.apply_chat_template(
                 list(prompt), add_generation_prompt=True, tokenize=False
             )
 
-            # Apply chat template to full conversation (prompt + assistant response)
-            full_messages = list(prompt) + [{"role": "assistant", "content": response_content}]
-            full_conversation_str = tokenizer.apply_chat_template(
-                full_messages, add_generation_prompt=False, tokenize=False
-            )
+            # 🔧 修复: 手动拼接 response,避免 chat_template 过滤 <think> 内容
+            # chat_template 会执行 content.split('</think>')[-1],导致整个 <think>...</think> 被移除
+            # 我们需要保留完整的推理过程,但要去掉开头重复的 <think> 标签
+            if response_content.strip().startswith('<think>'):
+                # 去掉开头的 <think>\n,因为 prompt_only_str 已经以 <think>\n 结尾
+                think_start = response_content.find('<think>')
+                response_content = response_content[think_start + 7:].lstrip()
+
+            # 手动拼接完整对话,添加 EOS token (保持与 chat_template 的规范操作一致)
+            full_conversation_str = prompt_only_str + response_content + tokenizer.eos_token
 
             # Step 3: Tokenize both parts
             prompt_ids_output = tokenizer(
@@ -288,7 +294,7 @@ class SFTDataset(Dataset):
         }
 
     def _tokenize(self, example):
-        return self._tokenize_static(
+        result = self._tokenize_static(
             example,
             self.tokenizer,
             self.prompt_key,
@@ -297,6 +303,102 @@ class SFTDataset(Dataset):
             self.truncation,
             self.pad_token_id
         )
+
+        # 🔧 只在第一个样本时记录验证信息
+        if not self._logged_first_sample:
+            self._log_first_sample_info(example, result)
+            self._logged_first_sample = True
+
+        return result
+
+    def _log_first_sample_info(self, example, tokenized_result):
+        """记录第一个样本的关键验证信息 (简洁版)"""
+        import numpy as np
+
+        prompt = example[self.prompt_key]
+        response = example[self.response_key]
+
+        # 转换 numpy 数组
+        if isinstance(prompt, np.ndarray):
+            prompt = prompt.tolist() if prompt.ndim == 0 else list(prompt)
+        if isinstance(response, np.ndarray):
+            response = response.tolist() if response.ndim == 0 else list(response)
+
+        # 判断是否为 chat 格式
+        is_chat_format = isinstance(prompt, (list, tuple)) and len(prompt) > 0 and isinstance(prompt[0], dict)
+
+        if is_chat_format:
+            # 提取 response 内容
+            if isinstance(response, (list, tuple)) and len(response) > 0 and isinstance(response[0], dict):
+                response_content = response[0].get("content", "")
+            else:
+                response_content = response
+
+            # 计算原始 response 的统计信息
+            original_response_len = len(response_content)
+            has_think_start = '<think>' in response_content
+            has_think_end = '</think>' in response_content
+
+            # 获取实际处理的结果
+            input_ids = tokenized_result['input_ids']
+            loss_mask = tokenized_result['loss_mask']
+
+            # 计算 prompt 和 response 的 token 数量
+            prompt_tokens = int(np.sum(loss_mask == 0))  # loss_mask=0 的是 prompt 部分
+            response_tokens = int(np.sum(loss_mask == 1))  # loss_mask=1 的是 response 部分
+            total_tokens = prompt_tokens + response_tokens
+
+            # 解码 prompt 和 response 部分
+            prompt_ids_only = input_ids[loss_mask == 0]
+            prompt_decoded = self.tokenizer.decode(prompt_ids_only, skip_special_tokens=False)
+
+            response_ids = input_ids[loss_mask == 1]
+            response_decoded = self.tokenizer.decode(response_ids, skip_special_tokens=False)
+            has_think_end_in_output = '</think>' in response_decoded
+            has_eos_in_output = self.tokenizer.eos_token in response_decoded if self.tokenizer.eos_token else False
+
+            # 记录验证信息
+            print("\n" + "=" * 80)
+            print("🔧 训练数据验证 (样本 #0)")
+            print("=" * 80)
+            print(f"   📊 数据统计:")
+            print(f"      - 原始 Response: {original_response_len} 字符")
+            print(f"      - 包含 <think>: {has_think_start}, 包含 </think>: {has_think_end}")
+            print("")
+            print(f"   ✅ 验证结果:")
+            print(f"      - Response 保留 </think>: {has_think_end_in_output}")
+            print(f"      - Response 包含 EOS token: {has_eos_in_output}")
+            print("")
+            print(f"   📊 Token 统计:")
+            print(f"      - Prompt tokens: {prompt_tokens}")
+            print(f"      - Response tokens: {response_tokens}")
+            print(f"      - Total tokens: {total_tokens}")
+            print("")
+            print(f"   📝 实际处理后的数据:")
+            print(f"      Prompt 结尾 (最后 150 字符):")
+            print(f"      {repr(prompt_decoded[-150:])}")
+            print("")
+            print(f"      Response 开头 (前 200 字符):")
+            print(f"      {repr(response_decoded[:200])}")
+            print("")
+            print(f"      Response 结尾 (最后 150 字符):")
+            print(f"      {repr(response_decoded[-150:])}")
+            print("=" * 80 + "\n")
+        else:
+            # 简单格式,只记录基本信息
+            print("\n" + "=" * 80)
+            print("🔧 训练数据验证 (样本 #0) - 简单格式")
+            print("=" * 80)
+            input_ids = tokenized_result['input_ids']
+            loss_mask = tokenized_result['loss_mask']
+            prompt_tokens = int(np.sum(loss_mask == 0))
+            response_tokens = int(np.sum(loss_mask == 1))
+            total_tokens = prompt_tokens + response_tokens
+            print(f"   📊 Token 统计:")
+            print(f"      - Prompt tokens: {prompt_tokens}")
+            print(f"      - Response tokens: {response_tokens}")
+            print(f"      - Total tokens: {total_tokens}")
+            print("=" * 80 + "\n")
 
     def __len__(self):
         return len(self.dataframe)
