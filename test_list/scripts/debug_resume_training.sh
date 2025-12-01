@@ -9,6 +9,10 @@
 
 set -x
 
+# 激活conda环境
+eval "$(conda shell.bash hook)"
+conda activate dllm_zihan
+
 if [ "$#" -lt 2 ]; then
     echo "Usage: $0 <num_gpus> <checkpoint_path> [log_file]"
     echo "Example: $0 4 dllm_reasoning/checkpoints/interleaved_sft/global_step_17172 debug_resume.log"
@@ -41,18 +45,21 @@ save_dir="${checkpoint_path}_debug"
 echo "新的保存目录: $save_dir"
 
 # 构建训练命令 - 只运行20步用于debug
+# 使用checkpoint中的huggingface模型
+model_path="${checkpoint_path}/huggingface"
+
 cmd="torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     -m dllm_reasoning.train_interleaved_sft \
     trainer.default_local_dir=\"$save_dir\" \
-    trainer.resume_from=\"$checkpoint_path\" \
-    trainer.max_steps=20 \
-    trainer.log_interval=1 \
+    trainer.resume_mode=auto \
+    trainer.resume_from_path=\"$checkpoint_path\" \
+    trainer.max_debug_steps=20 \
     data.train_files=data/openr1.parquet \
     data.val_files=null \
     data.block_size=4 \
     data.micro_batch_size_per_gpu=2 \
     model.enable_gradient_checkpointing=true \
-    model.partial_pretrain=dllm_reasoning/dllm_reasoning/model/DLLM-1.5B"
+    model.partial_pretrain=\"$model_path\""
 
 # 如果指定了日志文件，则重定向输出
 if [ -n "$log_file" ]; then

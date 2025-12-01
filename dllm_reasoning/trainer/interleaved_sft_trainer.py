@@ -446,7 +446,8 @@ class InterleavedSFTTrainer:
         should_update_optimizer = not is_accumulation_step
 
         # ========== 调试日志 ==========
-        should_log_detail = (global_step % 10 == 0) and self.debug_logger is not None
+        # 修改为每步都输出详细日志(用于debug)
+        should_log_detail = self.debug_logger is not None
 
         if should_log_detail:
             input_ids = batch["input_ids"]
@@ -531,35 +532,35 @@ class InterleavedSFTTrainer:
 
                         # 计算Mask准确率
                         if len(mask_positions) > 0:
-                            mask_pos_tensor = torch.tensor(mask_positions, device=device)
+                            mask_pos_tensor = torch.tensor(mask_positions, device=labels.device)
                             mask_labels = labels_0[mask_pos_tensor]
                             mask_valid = mask_labels != -100
                             if mask_valid.sum() > 0:
                                 mask_correct = ((predictions_0[mask_pos_tensor] == mask_labels) & mask_valid).sum()
                                 mask_acc = mask_correct.float() / mask_valid.sum().float()
                             else:
-                                mask_acc = torch.tensor(0.0, device=device)
+                                mask_acc = torch.tensor(0.0, device=labels.device)
                         else:
-                            mask_acc = torch.tensor(0.0, device=device)
+                            mask_acc = torch.tensor(0.0, device=labels.device)
 
                         # 计算Real准确率
                         if len(real_positions) > 0:
-                            real_pos_tensor = torch.tensor(real_positions, device=device)
+                            real_pos_tensor = torch.tensor(real_positions, device=labels.device)
                             real_labels = labels_0[real_pos_tensor]
                             real_valid = real_labels != -100
                             if real_valid.sum() > 0:
                                 real_correct = ((predictions_0[real_pos_tensor] == real_labels) & real_valid).sum()
                                 real_acc = real_correct.float() / real_valid.sum().float()
                             else:
-                                real_acc = torch.tensor(0.0, device=device)
+                                real_acc = torch.tensor(0.0, device=labels.device)
                         else:
-                            real_acc = torch.tensor(0.0, device=device)
+                            real_acc = torch.tensor(0.0, device=labels.device)
 
                         # 计算Prompt[-1]准确率
-                        prompt_last_acc = torch.tensor(0.0, device=device)
+                        prompt_last_acc = torch.tensor(0.0, device=labels.device)
                         if prompt_len > 0 and labels_0[prompt_len - 1].item() != -100:
                             if predictions_0[prompt_len - 1].item() == labels_0[prompt_len - 1].item():
-                                prompt_last_acc = torch.tensor(1.0, device=device)
+                                prompt_last_acc = torch.tensor(1.0, device=labels.device)
 
                         self.debug_logger.info(f"\n准确率详细分析 (Sample 0):")
                         self.debug_logger.info(f"  总体准确率: {accuracy.item():.4f}")
@@ -597,7 +598,7 @@ class InterleavedSFTTrainer:
                                     f"pred={pred_id:6d}, true={true_id:6d}"
                                 )
             else:
-                accuracy = torch.tensor(0.0, device=device)
+                accuracy = torch.tensor(0.0, device=labels.device)
 
         # ========== 反向传播和优化器更新 ==========
         scaled_loss = loss / self.gradient_accumulation_steps
@@ -741,7 +742,7 @@ class InterleavedSFTTrainer:
                     correct = (predictions == labels) & valid_mask
                     accuracy = correct.sum().float() / valid_mask.sum().float()
                 else:
-                    accuracy = torch.tensor(0.0, device=device)
+                    accuracy = torch.tensor(0.0, device=labels.device)
 
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
