@@ -53,7 +53,7 @@ cmd="torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.block_size=4 \
     data.micro_batch_size_per_gpu=2 \
     model.enable_gradient_checkpointing=true \
-    model.partial_pretrain=dllm_reasoning/dllm_reasoning/model/DLLM-1.5B \
+    model.partial_pretrain=dllm_reasoning/dllm_reasoning/models/DLLM-1.5B \
     $@"
 
 # 如果指定了日志文件，则重定向输出

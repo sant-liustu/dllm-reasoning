@@ -635,10 +635,8 @@ def collate_interleaved_batch(batch: List[dict], pad_token_id: int, ignore_index
 
         # Store block_info and prompt_len
         # Note: block_info contains (seg_type, seg_idx, seg_len)
-        # seg_idx is the index in the original interleaved_ids list, not useful after concat
-        # We only need (seg_type, seg_len) for mask construction
-        block_info_simplified = [(seg_type, seg_len) for seg_type, _, seg_len in item["block_info"]]
-        block_info_batch.append(block_info_simplified)
+        # Keep the full 3-tuple format for compatibility with model
+        block_info_batch.append(item["block_info"])
         prompt_len_batch.append(item["prompt_len"])
 
     return {

@@ -27,6 +27,10 @@ sys.path.insert(0, project_root)
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+# 禁用 torch.compile 以避免 FlexAttention BlockMask 编译错误
+import torch._dynamo
+torch._dynamo.config.disable = True
+
 import logging
 import hydra
 import torch

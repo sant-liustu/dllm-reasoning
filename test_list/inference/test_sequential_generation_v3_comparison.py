@@ -15,15 +15,8 @@
 import os
 os.environ["TORCH_COMPILE_DISABLE"] = "1"  # 禁用torch.compile以支持FlexAttention
 
-import sys
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from datasets import load_dataset
-import json
-
-# 导入数据集
-sys.path.append('/data/v-zihaliu/amlt-RLF-ExpConfig/Dream/dllm_reasoning')
-from dllm_reasoning.trainer.interleaved_sft_dataset import InterleavedSFTDataset
 
 
 def test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
@@ -52,13 +45,8 @@ def test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
         masks = torch.full((num_masks,), mask_token_id, dtype=torch.long, device=device)
         input_with_masks = torch.cat([current_generated, masks], dim=0)
 
-        # Step 2: 构造position_ids (和训练时一样overlap)
-        current_max_pos = current_generated.size(0) - 1
-        mask_positions = torch.arange(current_max_pos, current_max_pos + num_masks, device=device)
-        position_ids = torch.cat([
-            torch.arange(current_generated.size(0), device=device),
-            mask_positions
-        ], dim=0)
+        # Step 2: 构造position_ids (连续递增，不overlap！)
+        position_ids = torch.arange(input_with_masks.size(0), device=device)
 
         # Step 3: 构造block_info - 方式1
         # ⚠️ 包含已生成的response部分
@@ -96,8 +84,9 @@ def test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
         predicted_tokens = torch.argmax(mask_logits, dim=-1)
 
         # Step 7: 获取ground truth并计算准确率
-        gt_start = prompt_len + block_idx * 4 + 1  # Mask[i] predicts Real[i+1]
-        ground_truth = sample['input_ids'][gt_start:gt_start + num_masks]
+        # Mask[i] predicts Real[i+1], 所以从response的第block_idx*4+1个token开始
+        gt_start = block_idx * block_size + 1
+        ground_truth = response_ids[gt_start:gt_start + num_masks]
 
         correct = (predicted_tokens == ground_truth).sum().item()
         total_mask_tokens += num_masks
@@ -105,8 +94,9 @@ def test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
 
         # Step 8: Teacher forcing - 使用正确的label继续生成
         # 获取完整的real block (4 tokens)
-        real_block_start = prompt_len + block_idx * 4
-        real_block = sample['input_ids'][real_block_start:real_block_start + 4]
+        real_block_start = block_idx * block_size
+        real_block_end = min(real_block_start + block_size, response_ids.size(0))
+        real_block = response_ids[real_block_start:real_block_end]
         current_generated = torch.cat([current_generated, real_block], dim=0)
 
         block_idx += 1
@@ -115,40 +105,34 @@ def test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
     return accuracy
 
 
-def test_method_2(model, tokenizer, sample, prompt_len, device):
+def test_method_2(model, tokenizer, prompt_ids, full_ids, prompt_len, device):
     """
     方式2: 把已生成的response当作prompt的延伸
     block_info = [('mask', 3)]
     prompt_len = len(prompt + 已生成response)
     """
-    model.train()  # 使用training mode以启用FlexAttention
-
     num_masks = 3
-    mask_token_id = tokenizer.encode('<|mask|>', add_special_tokens=False)[0]
+    mask_token_id = tokenizer.eos_token_id
 
     # 开始：只有prompt
-    input_ids = sample['input_ids'][:prompt_len]
-    current_generated = input_ids.clone()
+    current_generated = prompt_ids.clone()
+    response_ids = full_ids[prompt_len:]
 
     # 统计信息
     total_mask_tokens = 0
     correct_mask_predictions = 0
 
     block_idx = 0
-    total_blocks = (len(sample['input_ids']) - prompt_len) // 4
+    block_size = 4
+    total_blocks = min((response_ids.size(0) + block_size - 1) // block_size, 50)
 
     while block_idx < total_blocks:
         # Step 1: 添加mask tokens
         masks = torch.full((num_masks,), mask_token_id, dtype=torch.long, device=device)
         input_with_masks = torch.cat([current_generated, masks], dim=0)
 
-        # Step 2: 构造position_ids (和训练时一样overlap)
-        current_max_pos = current_generated.size(0) - 1
-        mask_positions = torch.arange(current_max_pos, current_max_pos + num_masks, device=device)
-        position_ids = torch.cat([
-            torch.arange(current_generated.size(0), device=device),
-            mask_positions
-        ], dim=0)
+        # Step 2: 构造position_ids (连续递增，不overlap！)
+        position_ids = torch.arange(input_with_masks.size(0), device=device)
 
         # Step 3: 构造block_info - 方式2
         # ⚠️ 只有mask block，把已生成的都当作prompt
@@ -178,16 +162,17 @@ def test_method_2(model, tokenizer, sample, prompt_len, device):
         predicted_tokens = torch.argmax(mask_logits, dim=-1)
 
         # Step 7: 获取ground truth并计算准确率
-        gt_start = prompt_len + block_idx * 4 + 1
-        ground_truth = sample['input_ids'][gt_start:gt_start + num_masks]
+        gt_start = block_idx * block_size + 1
+        ground_truth = response_ids[gt_start:gt_start + num_masks]
 
         correct = (predicted_tokens == ground_truth).sum().item()
         total_mask_tokens += num_masks
         correct_mask_predictions += correct
 
         # Step 8: Teacher forcing - 使用正确的label继续生成
-        real_block_start = prompt_len + block_idx * 4
-        real_block = sample['input_ids'][real_block_start:real_block_start + 4]
+        real_block_start = block_idx * block_size
+        real_block_end = min(real_block_start + block_size, response_ids.size(0))
+        real_block = response_ids[real_block_start:real_block_end]
         current_generated = torch.cat([current_generated, real_block], dim=0)
 
         block_idx += 1
@@ -258,13 +243,13 @@ def main():
     print("\n" + "="*80)
     print("测试方式1: block_info包含已生成的response")
     print("="*80)
-    accuracy_method1 = test_method_1(model, tokenizer, sample, prompt_len, device)
+    accuracy_method1 = test_method_1(model, tokenizer, prompt_ids, full_ids, prompt_len, device)
     print(f"Mask准确率: {accuracy_method1:.4f} ({accuracy_method1*100:.2f}%)")
 
     print("\n" + "="*80)
     print("测试方式2: 把已生成的response当作prompt延伸")
     print("="*80)
-    accuracy_method2 = test_method_2(model, tokenizer, sample, prompt_len, device)
+    accuracy_method2 = test_method_2(model, tokenizer, prompt_ids, full_ids, prompt_len, device)
     print(f"Mask准确率: {accuracy_method2:.4f} ({accuracy_method2*100:.2f}%)")
 
     print("\n" + "="*80)

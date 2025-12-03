@@ -43,7 +43,7 @@ import verl.utils.hdfs_io as hdfs_io
 
 # VERL checkpoint 相关
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
 
 # 交错训练专用工具
 # Note: create_block_mask_from_batch 已移至模型内部,不再需要导入
@@ -166,6 +166,7 @@ class InterleavedSFTTrainer:
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
+            seed=42,  # 固定seed保证数据顺序确定性,用于checkpoint恢复
         )
 
         # 使用自定义 collate_fn 处理变长序列
@@ -340,7 +341,7 @@ class InterleavedSFTTrainer:
         )
 
     def load_checkpoint(self):
-        """加载 checkpoint (参考 VERL 的实现)"""
+        """加载 checkpoint (参考 VERL 的实现),包括训练状态恢复"""
         # 根据配置确定恢复路径
         checkpoint_path = self._determine_resume_path()
 
@@ -351,6 +352,9 @@ class InterleavedSFTTrainer:
                 rank=self.rank,
                 log_only_rank_0=True,
             )
+            # 初始化恢复状态为0
+            self.resume_epoch = 0
+            self.resume_batch_idx = 0
             return 0
 
         # 从 checkpoint 路径中提取步数
@@ -363,6 +367,8 @@ class InterleavedSFTTrainer:
                 level=logging.WARNING,
                 log_only_rank_0=True,
             )
+            self.resume_epoch = 0
+            self.resume_batch_idx = 0
             return 0
 
         self.resume_global_step = resume_step
@@ -370,12 +376,35 @@ class InterleavedSFTTrainer:
         # 使用 checkpoint manager 加载模型、优化器、学习率调度器
         self.checkpoint_manager.load_checkpoint(checkpoint_path)
 
-        log_with_rank(
-            f"成功从 {checkpoint_path} 加载 checkpoint (step {resume_step})",
-            logger=logger,
-            rank=self.rank,
-            log_only_rank_0=True,
-        )
+        # 加载训练状态信息 (用于确定性恢复)
+        state_file = os.path.join(checkpoint_path, 'training_state.pt')
+        if os.path.exists(state_file):
+            training_state = torch.load(state_file, map_location='cpu', weights_only=False)
+            self.resume_epoch = training_state['epoch']
+            self.resume_batch_idx = training_state['batch_idx']
+
+            log_with_rank(
+                f"成功从 {checkpoint_path} 加载 checkpoint (step {resume_step})\n"
+                f"  恢复训练状态: epoch={self.resume_epoch}, batch_idx={self.resume_batch_idx}",
+                logger=logger,
+                rank=self.rank,
+                log_only_rank_0=True,
+            )
+        else:
+            # 向后兼容: 旧checkpoint没有training_state.pt
+            # 从global_step估算epoch和batch_idx
+            steps_per_epoch = len(self.train_dataloader)
+            self.resume_epoch = resume_step // steps_per_epoch
+            self.resume_batch_idx = resume_step % steps_per_epoch
+
+            log_with_rank(
+                f"成功从 {checkpoint_path} 加载 checkpoint (step {resume_step})\n"
+                f"  旧checkpoint格式,估算恢复位置: epoch={self.resume_epoch}, batch_idx={self.resume_batch_idx}",
+                logger=logger,
+                rank=self.rank,
+                level=logging.WARNING,
+                log_only_rank_0=True,
+            )
 
         return resume_step
 
@@ -523,7 +552,7 @@ class InterleavedSFTTrainer:
                         real_positions = []
 
                         current_pos = prompt_len
-                        for seg_type, seg_len in block_info:
+                        for seg_type, seg_idx, seg_len in block_info:
                             if seg_type == 'mask':
                                 mask_positions.extend(range(current_pos, current_pos + seg_len))
                             elif seg_type == 'real':
@@ -645,12 +674,14 @@ class InterleavedSFTTrainer:
 
         return metrics
 
-    def save_checkpoint(self, step: int):
+    def save_checkpoint(self, step: int, epoch: int = None, batch_idx: int = None):
         """
         保存检查点 (使用 VERL 的 checkpoint_manager)
 
         Args:
             step: int - 全局步数
+            epoch: int - 当前epoch (用于确定性恢复)
+            batch_idx: int - 当前epoch内的batch索引 (用于确定性恢复)
         """
         path = os.path.join(
             self.config.trainer.default_local_dir,
@@ -675,6 +706,26 @@ class InterleavedSFTTrainer:
             rank=self.rank,
             log_only_rank_0=True,
         )
+
+        # 保存训练状态信息 (用于确定性恢复)
+        if self.rank == 0:
+            # 保存训练进度信息
+            if epoch is not None and batch_idx is not None:
+                training_state = {
+                    'global_step': step,
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'total_batches_per_epoch': len(self.train_dataloader),
+                }
+                state_file = os.path.join(path, 'training_state.pt')
+                torch.save(training_state, state_file)
+                logger.info(f"已保存训练状态: epoch={epoch}, batch_idx={batch_idx}")
+
+            # 更新 checkpoint tracker 文件
+            tracker_file = get_checkpoint_tracker_filename(self.config.trainer.default_local_dir)
+            with open(tracker_file, 'w') as f:
+                f.write(str(step))
+            logger.info(f"已更新 checkpoint tracker: {tracker_file} -> step {step}")
 
         # 可选：复制到 HDFS（如果配置了）
         if self.rank == 0 and self.config.trainer.get("default_hdfs_dir"):
@@ -824,20 +875,53 @@ class InterleavedSFTTrainer:
         self.optimizer.zero_grad()
 
         # 主训练循环
-        for epoch in range(self.current_epoch, self.config.trainer.total_epochs):
+        start_epoch = getattr(self, 'resume_epoch', 0)
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.current_epoch = epoch
             self.train_sampler.set_epoch(epoch)  # 重要：让 DDP 的 shuffle 正确工作
 
+            # 计算本epoch需要跳过的batch数 (用于确定性恢复)
+            if epoch == start_epoch:
+                skip_batches = getattr(self, 'resume_batch_idx', 0)
+            else:
+                skip_batches = 0
+
+            if self.rank == 0 and skip_batches > 0:
+                logger.info(f"Epoch {epoch}: 跳过前 {skip_batches} 个batch以实现确定性恢复")
+
             # Epoch 内的训练
             dataloader_iter = iter(self.train_dataloader)
+
+            # 快速跳过已处理的batch (确定性恢复)
+            if skip_batches > 0:
+                if self.rank == 0:
+                    logger.info(f"快速跳过前 {skip_batches} 个batch (这可能需要一些时间)...")
+
+                # 直接消耗dataloader_iter的前skip_batches个元素
+                from itertools import islice
+                # 创建一个临时的tqdm来显示跳过进度
+                if self.rank == 0:
+                    skip_pbar = tqdm(total=skip_batches, desc=f"跳过batch", disable=False)
+                    for _ in islice(dataloader_iter, skip_batches):
+                        skip_pbar.update(1)
+                    skip_pbar.close()
+                else:
+                    # 其他rank不显示进度条,直接跳过
+                    for _ in islice(dataloader_iter, skip_batches):
+                        pass
+
+                if self.rank == 0:
+                    logger.info(f"跳过完成,从batch {skip_batches}开始训练")
+
+            # 创建进度条(只显示剩余的batch)
             pbar = tqdm(
                 dataloader_iter,
                 desc=f"Epoch {epoch}",
-                total=len(self.train_dataloader),
+                total=len(self.train_dataloader) - skip_batches,
                 disable=(self.rank != 0),
             )
 
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar, start=skip_batches):
                 # 训练步骤
                 metrics = self.training_step(batch, global_step)
 
@@ -856,9 +940,9 @@ class InterleavedSFTTrainer:
 
                 global_step += 1
 
-                # 保存检查点
+                # 保存检查点 (包含训练状态信息)
                 if global_step % self.config.trainer.save_checkpoint_steps == 0:
-                    self.save_checkpoint(step=global_step)
+                    self.save_checkpoint(step=global_step, epoch=epoch, batch_idx=batch_idx + 1)
 
                 # ========== 调试模式：最大步数限制 ==========
                 max_debug_steps = self.config.trainer.get("max_debug_steps", None)
@@ -877,5 +961,5 @@ class InterleavedSFTTrainer:
             logger.info("训练完成！")
             logger.info("=" * 60)
 
-        # 保存最终检查点
+        # 保存最终检查点 (不需要epoch/batch_idx,因为训练已完成)
         self.save_checkpoint(step=global_step)

@@ -362,7 +362,7 @@ def block_attn_mask(num_tokens, block_size, device):
     return masks
 
 
-# @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")  # Disabled: causing compilation errors with BlockMask
+@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(query, key, value, attention_mask, **kwargs):
     return flex_attention(query, key, value, block_mask=attention_mask, **kwargs)
 
@@ -535,14 +535,41 @@ class DLLMAttention(nn.Module):
         bsz, q_len = input_shape
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        # DEBUG: 只在Layer 0打印
+        if self.layer_idx == 0 and self.training:
+            print(f"\n[Layer 0 DEBUG] seq_len={q_len}")
+            # 假设M₁在位置277
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"[Layer 0 DEBUG] hidden_states[0, {m1_pos}, :5] = {hidden_states[0, m1_pos, :5]}")
+
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        # DEBUG: 打印K/V投影后的结果(在RoPE之前)
+        if self.layer_idx == 0 and self.training:
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"[Layer 0 DEBUG] Before RoPE:")
+            print(f"  key_states[:, :, {m1_pos}, :5] = {key_states[:, :, m1_pos, :5]}")
+            print(f"  value_states[:, :, {m1_pos}, :5] = {value_states[:, :, m1_pos, :5]}")
+
         cos, sin = position_embeddings
+
+        # DEBUG: 打印position embeddings
+        if self.layer_idx == 0 and self.training:
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"[Layer 0 DEBUG] Position embeddings at {m1_pos}:")
+            print(f"  cos[0, {m1_pos}, :5] = {cos[0, m1_pos, :5]}")
+            print(f"  sin[0, {m1_pos}, :5] = {sin[0, m1_pos, :5]}")
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin)
+
+        # DEBUG: 打印RoPE之后的K
+        if self.layer_idx == 0 and self.training:
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"[Layer 0 DEBUG] After RoPE:")
+            print(f"  key_states[:, :, {m1_pos}, :5] = {key_states[:, :, m1_pos, :5]}")
 
         if past_key_value is not None and kwargs.get("store_kv", False):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -559,6 +586,16 @@ class DLLMAttention(nn.Module):
         if self.training:
             # Training mode: use FlexAttention for block diffusion
 
+            # DEBUG: 在FlexAttention之前打印Q/K/V
+            if self.layer_idx == 0:
+                m1_pos = 277 if q_len > 277 else q_len - 1
+                print(f"\n[Layer 0 DEBUG] Before FlexAttention:")
+                print(f"  query_states[:, :, {m1_pos}, :5] = {query_states[:, :, m1_pos, :5]}")
+                print(f"  key_states[:, :, {m1_pos}, :5] = {key_states[:, :, m1_pos, :5]}")
+                print(f"  value_states[:, :, {m1_pos}, :5] = {value_states[:, :, m1_pos, :5]}")
+                print(f"  Q/K/V shapes: {query_states.shape}, {key_states.shape}, {value_states.shape}")
+                print(f"  scaling: {self.scaling}")
+
             attn_output, attn_weights = fused_flex_attention(
                 query=query_states,
                 key=key_states,
@@ -569,9 +606,22 @@ class DLLMAttention(nn.Module):
                 return_lse=True
             )
 
+            # DEBUG: 在FlexAttention之后打印输出
+            if self.layer_idx == 0:
+                m1_pos = 277 if q_len > 277 else q_len - 1
+                print(f"\n[Layer 0 DEBUG] After FlexAttention:")
+                print(f"  attn_output[:, :, {m1_pos}, :5] = {attn_output[:, :, m1_pos, :5]}")
+                print(f"  attn_output shape: {attn_output.shape}")
+
             attn_weights = attn_weights.to(
                 value_states.dtype) if attn_weights is not None else None
             attn_output = rearrange(attn_output, 'b h l d -> b l (h d)')
+
+            # DEBUG: 在rearrange之后打印
+            if self.layer_idx == 0:
+                m1_pos = 277 if q_len > 277 else q_len - 1
+                print(f"\n[Layer 0 DEBUG] After rearrange:")
+                print(f"  attn_output[0, {m1_pos}, :5] = {attn_output[0, m1_pos, :5]}")
         else:
             # Inference mode: use standard Qwen2-style attention (eager)
             attn_output, attn_weights = eager_attention_forward(
@@ -585,7 +635,19 @@ class DLLMAttention(nn.Module):
             )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
+        # DEBUG: 在o_proj之前
+        if self.layer_idx == 0:
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"\n[Layer 0 DEBUG] Before o_proj:")
+            print(f"  attn_output[0, {m1_pos}, :5] = {attn_output[0, m1_pos, :5]}")
+
         attn_output = self.o_proj(attn_output)
+
+        # DEBUG: 在o_proj之后
+        if self.layer_idx == 0:
+            m1_pos = 277 if q_len > 277 else q_len - 1
+            print(f"\n[Layer 0 DEBUG] After o_proj (attention final output):")
+            print(f"  attn_output[0, {m1_pos}, :5] = {attn_output[0, m1_pos, :5]}")
 
         return attn_output, attn_weights  # , attn_weights
 
@@ -646,6 +708,13 @@ class DLLMDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        # DEBUG: 打印每一层在M₁位置的输出
+        if self.self_attn.training:
+            bsz, seq_len, hidden_dim = hidden_states.shape
+            m1_pos = 277 if seq_len > 277 else seq_len - 1
+            layer_idx = self.self_attn.layer_idx
+            print(f"[Layer {layer_idx:2d} Output] hidden_states[0, {m1_pos}, :5] = {hidden_states[0, m1_pos, :5]}")
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -1392,6 +1461,12 @@ class DLLMForCausalLM(DLLMPreTrainedModel, GenerationMixin):
             # 但实际上这里的 "logits" 是 hidden_states（未经过 lm_head）
             # Trainer 会负责应用 lm_head
             logits = self.lm_head(hidden_states)
+
+            # DEBUG: 打印最终logits在M₁位置的值
+            bsz, seq_len, vocab_size = logits.shape
+            m1_pos = 277 if seq_len > 277 else seq_len - 1
+            print(f"\n[Final Logits] logits[0, {m1_pos}, :5] = {logits[0, m1_pos, :5]}")
+            print(f"[Final Logits] Top 5 token IDs: {logits[0, m1_pos].topk(5).indices.tolist()}\n")
 
             loss = None
         else:
