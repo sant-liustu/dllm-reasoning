@@ -99,15 +99,58 @@ def test_interleaved_teacher_forcing(model, tokenizer, prompt_ids, full_ids, pro
     print(f"测试blocks: {num_blocks}")
     print(f"实际测试tokens: {actual_test_len}")
 
-    # 构造block_info - 完整的interleaved格式
-    block_info = []
-    for i in range(num_blocks):
-        block_info.append(('real', 1))   # Real token
-        block_info.append(('mask', block_size - 1))  # Mask tokens
+    # 构造interleaved序列 - 和训练时一致
+    # 格式: [M₁, M₂, M₃, R₁, M₁, M₂, M₃, R₂, ...]
+    # block_info格式: (seg_type, seg_idx, seg_len)
 
-    # 准备input: prompt + response (实际的response tokens)
-    test_ids = torch.cat([prompt_ids, response_ids[:actual_test_len]], dim=0)
-    position_ids = torch.arange(test_ids.size(0), device=device)
+    eos_token_id = tokenizer.eos_token_id
+    num_masks = block_size - 1
+
+    # 构造interleaved序列
+    interleaved_ids_list = []
+    interleaved_pos_list = []
+    block_info = []
+
+    current_pos = 0  # Position从0开始计数
+
+    for i in range(num_blocks):
+        block_start = i * block_size
+        block_end = min(block_start + block_size, actual_test_len)
+        actual_block_len = block_end - block_start
+
+        if actual_block_len == 0:
+            break
+
+        # 只有当block长度 > num_masks时才添加mask
+        if actual_block_len > num_masks:
+            # 添加mask tokens
+            mask_tokens = torch.full((num_masks,), eos_token_id, dtype=prompt_ids.dtype, device=device)
+            mask_positions = torch.arange(current_pos, current_pos + num_masks, device=device)
+
+            interleaved_ids_list.append(mask_tokens)
+            interleaved_pos_list.append(mask_positions)
+            block_info.append(('mask', len(interleaved_ids_list) - 1, num_masks))
+
+        # 添加real block tokens
+        real_tokens = response_ids[block_start:block_end]
+        real_positions = torch.arange(current_pos, current_pos + actual_block_len, device=device)
+
+        interleaved_ids_list.append(real_tokens)
+        interleaved_pos_list.append(real_positions)
+        block_info.append(('real', len(interleaved_ids_list) - 1, actual_block_len))
+
+        # 更新position
+        current_pos += actual_block_len
+
+    # 拼接interleaved序列
+    interleaved_response = torch.cat(interleaved_ids_list, dim=0)
+    interleaved_positions = torch.cat(interleaved_pos_list, dim=0)
+
+    # 最终输入: prompt + interleaved_response
+    test_ids = torch.cat([prompt_ids, interleaved_response], dim=0)
+    # Position IDs: prompt部分从0开始, response部分接着prompt长度继续
+    prompt_positions = torch.arange(prompt_len, device=device)
+    position_ids = torch.cat([prompt_positions, interleaved_positions + prompt_len], dim=0)
 
     # 前向传播 - 使用train模式以启用FlexAttention
     model.train()
@@ -124,57 +167,120 @@ def test_interleaved_teacher_forcing(model, tokenizer, prompt_ids, full_ids, pro
 
     predictions = logits.argmax(dim=-1)
 
-    # 统计mask位置的准确率
-    num_correct = 0
-    num_total = 0
+    # 统计mask和real位置的准确率
+    # Interleaved序列结构: prompt + [M₁,M₂,M₃,R₁, M₁,M₂,M₃,R₂, ...]
+    # Mask预测逻辑: mask[i]预测对应的real token
+    # Real预测逻辑: real[i]预测下一个real token
+
+    num_correct_mask = 0
+    num_total_mask = 0
+    num_correct_real = 0
+    num_total_real = 0
 
     print(f"\n前5个block的预测详情:")
-    for block_idx in range(min(5, num_blocks)):
-        block_start = prompt_len + block_idx * block_size
-        real_pos = block_start  # Real token位置
 
-        print(f"\n  Block {block_idx}:")
-        # Mask预测: mask[0]预测real[1], mask[1]预测real[2], mask[2]预测real[3]
-        for j in range(block_size - 1):
-            mask_pos = real_pos + j  # 当前mask的位置
-            pred_target_offset = j + 1  # 预测目标相对于real的偏移
+    # 遍历block_info统计mask和real的准确率
+    current_interleaved_idx = 0
+    for seg_type, seg_idx, seg_len in block_info:
+        if seg_type == 'mask':
+            # 找到对应的block index
+            block_idx = seg_idx // 2  # 每个block有2个segment (mask + real)
 
-            if block_start + pred_target_offset < prompt_len + actual_test_len:
-                pred_id = predictions[mask_pos].item()
-                true_id = response_ids[block_idx * block_size + pred_target_offset].item()
+            if block_idx >= num_blocks:
+                break
+
+            # Mask段在interleaved序列中的起始位置
+            mask_start_in_interleaved = current_interleaved_idx
+
+            # Mask预测的目标: 对应原始response的token[block_idx*block_size+1 : block_idx*block_size+1+seg_len]
+            target_start = block_idx * block_size + 1
+            target_end = target_start + seg_len
+
+            if target_end > response_len:
+                target_end = response_len
+
+            actual_targets = response_ids[target_start:target_end]
+
+            if block_idx < 5:
+                print(f"\n  Block {block_idx} - Mask部分:")
+
+            # 遍历mask中的每个位置
+            for mask_offset in range(seg_len):
+                if target_start + mask_offset >= response_len:
+                    break
+
+                # Mask在test_ids中的位置(加上prompt长度)
+                mask_pos_in_test = prompt_len + mask_start_in_interleaved + mask_offset
+
+                # 预测值: logits[mask_pos_in_test]预测下一个token
+                pred_id = predictions[mask_pos_in_test].item()
+                true_id = actual_targets[mask_offset].item()
 
                 is_correct = pred_id == true_id
                 if is_correct:
-                    num_correct += 1
-                num_total += 1
+                    num_correct_mask += 1
+                num_total_mask += 1
 
-                if block_idx < 5:  # 只显示前5个block
+                if block_idx < 5:
                     status = "✅" if is_correct else "❌"
                     pred_text = tokenizer.decode([pred_id])
                     true_text = tokenizer.decode([true_id])
-                    print(f"    Mask[{j}]→Real[{pred_target_offset}]: {status} pred={pred_id:6d} '{pred_text}' | true={true_id:6d} '{true_text}'")
+                    print(f"    Mask[{mask_offset}]→Real[{mask_offset+1}]: {status} pred={pred_id:6d} '{pred_text}' | true={true_id:6d} '{true_text}'")
 
-    # 计算剩余blocks的准确率
-    for block_idx in range(5, num_blocks):
-        block_start = prompt_len + block_idx * block_size
-        real_pos = block_start
+        elif seg_type == 'real':
+            # Real段的准确率统计
+            block_idx = seg_idx // 2
 
-        for j in range(block_size - 1):
-            mask_pos = real_pos + j
-            pred_target_offset = j + 1
+            if block_idx >= num_blocks:
+                break
 
-            if block_start + pred_target_offset < prompt_len + actual_test_len:
-                pred_id = predictions[mask_pos].item()
-                true_id = response_ids[block_idx * block_size + pred_target_offset].item()
+            real_start_in_interleaved = current_interleaved_idx
 
-                if pred_id == true_id:
-                    num_correct += 1
-                num_total += 1
+            # Real预测的目标: 下一个token (原始response中的下一个位置)
+            # Real[i]在原始response的位置是 block_idx*block_size + i
+            # 它预测的是 block_idx*block_size + i + 1
 
-    accuracy = num_correct / num_total if num_total > 0 else 0.0
-    print(f"\nInterleaved Teacher Forcing准确率: {accuracy:.4f} ({num_correct}/{num_total})")
+            if block_idx < 5:
+                print(f"  Block {block_idx} - Real部分:")
 
-    return accuracy
+            for real_offset in range(seg_len):
+                orig_pos = block_idx * block_size + real_offset
+                next_orig_pos = orig_pos + 1
+
+                if next_orig_pos >= response_len:
+                    break
+
+                # Real token在test_ids中的位置
+                real_pos_in_test = prompt_len + real_start_in_interleaved + real_offset
+
+                # 预测值: logits[real_pos_in_test]预测下一个token
+                pred_id = predictions[real_pos_in_test].item()
+                true_id = response_ids[next_orig_pos].item()
+
+                is_correct = pred_id == true_id
+                if is_correct:
+                    num_correct_real += 1
+                num_total_real += 1
+
+                if block_idx < 5 and real_offset < 3:  # 只显示前3个
+                    status = "✅" if is_correct else "❌"
+                    pred_text = tokenizer.decode([pred_id])
+                    true_text = tokenizer.decode([true_id])
+                    print(f"    Real[{real_offset}]→Real[{real_offset+1}]: {status} pred={pred_id:6d} '{pred_text}' | true={true_id:6d} '{true_text}'")
+
+        current_interleaved_idx += seg_len
+
+    # 计算各部分准确率
+    mask_accuracy = num_correct_mask / num_total_mask if num_total_mask > 0 else 0.0
+    real_accuracy = num_correct_real / num_total_real if num_total_real > 0 else 0.0
+    overall_accuracy = (num_correct_mask + num_correct_real) / (num_total_mask + num_total_real) if (num_total_mask + num_total_real) > 0 else 0.0
+
+    print(f"\n统计结果:")
+    print(f"  Mask位置准确率: {mask_accuracy:.4f} ({num_correct_mask}/{num_total_mask})")
+    print(f"  Real位置准确率: {real_accuracy:.4f} ({num_correct_real}/{num_total_real})")
+    print(f"\nInterleaved总体准确率: {overall_accuracy:.4f} ({num_correct_mask + num_correct_real}/{num_total_mask + num_total_real})")
+
+    return overall_accuracy
 
 
 def test_block_by_block_teacher_forcing(model, tokenizer, prompt_ids, full_ids, prompt_len, device, block_size=4, max_blocks=50):
@@ -221,15 +327,15 @@ def test_block_by_block_teacher_forcing(model, tokenizer, prompt_ids, full_ids, 
         mask_block = torch.full((num_masks,), eos_token_id, device=device, dtype=current_ids.dtype)
         input_with_masks = torch.cat([current_ids, mask_block], dim=0)
 
-        # 构造block_info
+        # 构造block_info - 格式: (seg_type, seg_idx, seg_len)
         response_so_far = current_ids.size(0) - prompt_len
         if response_so_far > 0:
             # 已经有生成的response,把它们当作prompt延伸
-            block_info = [('mask', num_masks)]
+            block_info = [('mask', 0, num_masks)]
             effective_prompt_len = current_ids.size(0)
         else:
             # 第一个block
-            block_info = [('mask', num_masks)]
+            block_info = [('mask', 0, num_masks)]
             effective_prompt_len = prompt_len
 
         position_ids = torch.arange(input_with_masks.size(0), device=device)
@@ -291,11 +397,16 @@ def test_block_by_block_teacher_forcing(model, tokenizer, prompt_ids, full_ids, 
 
 def main():
     # 配置
-    MODEL_PATH = "/data/v-zihaliu/amlt-RLF-ExpConfig/Dream/dllm_reasoning/checkpoints/interleaved_sft_1202/global_step_8000/huggingface"
+    MODEL_PATH = "/data/v-zihaliu/amlt-RLF-ExpConfig/Dream/dllm_reasoning/checkpoints/interleaved_sft_1202/global_step_2000/huggingface"
     DATA_PATH = "/data/v-zihaliu/amlt-RLF-ExpConfig/Dream/data/openr1.parquet"
 
+    # 从路径中提取checkpoint编号
+    import re
+    match = re.search(r'global_step_(\d+)', MODEL_PATH)
+    ckpt_num = match.group(1) if match else "unknown"
+
     print("="*80)
-    print("测试Checkpoint 8000 - 三种Teacher Forcing场景")
+    print(f"测试Checkpoint {ckpt_num} - 三种Teacher Forcing场景")
     print("="*80)
 
     # 加载数据
