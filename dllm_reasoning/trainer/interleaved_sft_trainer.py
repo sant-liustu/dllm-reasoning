@@ -587,9 +587,13 @@ class InterleavedSFTTrainer:
 
                         # 计算Prompt[-1]准确率
                         prompt_last_acc = torch.tensor(0.0, device=labels.device)
-                        if prompt_len > 0 and labels_0[prompt_len - 1].item() != -100:
-                            if predictions_0[prompt_len - 1].item() == labels_0[prompt_len - 1].item():
-                                prompt_last_acc = torch.tensor(1.0, device=labels.device)
+                        # 添加边界检查：prompt_len 可能超过实际序列长度（截断后）
+                        # seems only for logging, so skip if out of range
+                        actual_seq_len = labels_0.shape[0]
+                        if prompt_len > 0 and prompt_len <= actual_seq_len:
+                            if labels_0[prompt_len - 1].item() != -100:
+                                if predictions_0[prompt_len - 1].item() == labels_0[prompt_len - 1].item():
+                                    prompt_last_acc = torch.tensor(1.0, device=labels.device)
 
                         self.debug_logger.info(f"\n准确率详细分析 (Sample 0):")
                         self.debug_logger.info(f"  总体准确率: {accuracy.item():.4f}")
